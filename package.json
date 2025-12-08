@@ -1,0 +1,19 @@
+{
+  "name": "git-contrib-analyzer",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "git-contrib-report": "dist/cli.mjs"
+  },
+  "scripts": {
+    "build": "shx mkdir -p dist && shx cp src/cli.mjs dist/cli.mjs",
+    "dev": "node src/cli.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "^1.31.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "shx": "^0.4.0"
+  }
+}
