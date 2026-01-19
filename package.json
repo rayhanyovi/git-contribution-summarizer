@@ -2,11 +2,10 @@
   "name": "git-contrib-analyzer",
   "version": "0.1.0",
   "type": "module",
-  "bin": {
-    "git-contrib-report": "dist/cli.mjs"
-  },
+  "bin": "dist/cli.mjs",
   "scripts": {
     "build": "shx mkdir -p dist && shx cp src/cli.mjs dist/cli.mjs",
+    "prepublishOnly": "npm run build",
     "dev": "node src/cli.mjs"
   },
   "dependencies": {

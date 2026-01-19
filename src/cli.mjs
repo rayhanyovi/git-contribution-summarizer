@@ -1,10 +1,10 @@
+#!/usr/bin/env node
 import "dotenv/config";
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
-import { fileURLToPath } from "node:url";
 import process from "node:process";
 
 // ----------- CLI ARGS -----------
@@ -15,9 +15,13 @@ function parseArgs() {
     path: ".",
     email: null,
     apiKey: null,
+    geminiApiKey: null,
+    openaiApiKey: null,
+    anthropicApiKey: null,
     since: null,
     until: null,
     model: null,
+    provider: null,
   };
 
   const takeNext = (i, arr) =>
@@ -46,6 +50,30 @@ function parseArgs() {
       }
       case "-g":
       case "--gemini-api-key": {
+        const v = takeNext(i, args);
+        if (v) {
+          out.geminiApiKey = v;
+          i++;
+        }
+        break;
+      }
+      case "--openai-api-key": {
+        const v = takeNext(i, args);
+        if (v) {
+          out.openaiApiKey = v;
+          i++;
+        }
+        break;
+      }
+      case "--anthropic-api-key": {
+        const v = takeNext(i, args);
+        if (v) {
+          out.anthropicApiKey = v;
+          i++;
+        }
+        break;
+      }
+      case "--api-key": {
         const v = takeNext(i, args);
         if (v) {
           out.apiKey = v;
@@ -77,6 +105,14 @@ function parseArgs() {
         }
         break;
       }
+      case "--provider": {
+        const v = takeNext(i, args);
+        if (v) {
+          out.provider = v;
+          i++;
+        }
+        break;
+      }
       default:
         break;
     }
@@ -96,8 +132,114 @@ function ask(question) {
     rl.question(question, (ans) => {
       rl.close();
       resolve(ans);
-    })
+    }),
   );
+}
+
+function makeColorizer(enabled) {
+  const codes = {
+    gray: "90",
+    red: "31",
+    green: "32",
+    yellow: "33",
+    blue: "34",
+    magenta: "35",
+    cyan: "36",
+  };
+  return (text, color) => {
+    if (!enabled || !color || !codes[color]) return text;
+    return `\u001b[${codes[color]}m${text}\u001b[0m`;
+  };
+}
+
+async function promptOptional(label, currentValue, colorize) {
+  const suffix = currentValue ? ` [${currentValue}]` : "";
+  const answer = (await ask(colorize(`${label}${suffix}: `, "cyan"))).trim();
+  return answer || currentValue || null;
+}
+
+async function promptRequired(label, currentValue, colorize) {
+  if (currentValue) return currentValue;
+  while (true) {
+    const answer = (await ask(colorize(`${label}: `, "cyan"))).trim();
+    if (answer) return answer;
+  }
+}
+
+function normalizeProvider(input) {
+  if (!input) return null;
+  const val = String(input).trim().toLowerCase();
+  if (val === "gemini" || val === "google") return "gemini";
+  if (val === "gpt" || val === "openai" || val === "chatgpt") return "gpt";
+  if (val === "claude" || val === "anthropic") return "claude";
+  return null;
+}
+
+async function selectFromList(label, options, initialIndex, colorize) {
+  if (!process.stdin.isTTY || !process.stdin.setRawMode) {
+    return options[Math.max(0, Math.min(initialIndex, options.length - 1))];
+  }
+
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  const prevRaw = stdin.isRaw;
+  readline.emitKeypressEvents(stdin);
+  stdin.setRawMode(true);
+
+  let index = Math.max(0, Math.min(initialIndex, options.length - 1));
+  let linesCount = 0;
+
+  const render = () => {
+    const lines = [];
+    lines.push(colorize(`${label} (use up/down, Enter)`, "cyan"));
+    for (let i = 0; i < options.length; i++) {
+      const prefix = i === index ? colorize(">", "green") : " ";
+      lines.push(`${prefix} ${options[i]}`);
+    }
+
+    if (linesCount > 0) {
+      stdout.write(`\u001b[${linesCount}A`);
+    }
+    stdout.write("\u001b[0J");
+    stdout.write(lines.join("\n") + "\n");
+    linesCount = lines.length;
+  };
+
+  render();
+
+  return new Promise((resolve) => {
+    const onKeypress = (_str, key) => {
+      if (key && key.ctrl && key.name === "c") {
+        process.exit(130);
+      }
+      if (key && (key.name === "up" || key.name === "k")) {
+        index = (index - 1 + options.length) % options.length;
+        render();
+        return;
+      }
+      if (key && (key.name === "down" || key.name === "j")) {
+        index = (index + 1) % options.length;
+        render();
+        return;
+      }
+      if (key && (key.name === "return" || key.name === "enter")) {
+        cleanup();
+        resolve(options[index]);
+      }
+    };
+
+    const cleanup = () => {
+      stdin.removeListener("keypress", onKeypress);
+      if (stdin.setRawMode) stdin.setRawMode(Boolean(prevRaw));
+      if (linesCount > 0) {
+        stdout.write(`\u001b[${linesCount}A`);
+        stdout.write("\u001b[0J");
+      }
+      stdout.write(colorize(`${label}: ${options[index]}\n`, "green"));
+    };
+
+    stdin.on("keypress", onKeypress);
+  });
 }
 
 function shortHash(hash) {
@@ -126,7 +268,7 @@ function execGit(args, cwd) {
       if (code === 0) resolve(out);
       else
         reject(
-          new Error(`git ${args.join(" ")} failed in ${cwd}:\n${err.trim()}`)
+          new Error(`git ${args.join(" ")} failed in ${cwd}:\n${err.trim()}`),
         );
     });
   });
@@ -273,20 +415,40 @@ function chunkCommits(enrichedCommits, maxCharsPerBatch = 40000) {
   return batches;
 }
 
-// ----------- GEMINI CLIENT (REST) -----------
+// ----------- LLM CLIENTS (REST) -----------
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const OPENAI_BASE = "https://api.openai.com/v1";
+const ANTHROPIC_BASE = "https://api.anthropic.com/v1";
 
-// Use a Flash model with good throughput by default
-const DEFAULT_MODEL = "gemini-2.5-flash-lite";
+const DEFAULT_MODELS = {
+  gemini: "gemini-2.5-flash-lite",
+  gpt: "gpt-4o-mini",
+  claude: "claude-3-5-sonnet-20240620",
+};
 
-async function analyzeCommitsBatch({ apiKey, model, commitsBatch }) {
-  if (typeof fetch !== "function") {
-    throw new Error(
-      "Global fetch is not available. Use Node 18+ or polyfill fetch."
-    );
-  }
+const MODEL_CHOICES = {
+  gemini: [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+  ],
+  gpt: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+  claude: [
+    "claude-3-5-sonnet-20240620",
+    "claude-3-5-haiku-20241022",
+    "claude-3-opus-20240229",
+  ],
+};
 
+const PROVIDER_MENU = [
+  { label: "Gemini (Google)", value: "gemini" },
+  { label: "ChatGPT (OpenAI)", value: "gpt" },
+  { label: "Claude (Anthropic)", value: "claude" },
+];
+
+function buildPrompt(commitsBatch) {
   const blocks = commitsBatch
     .map((c, idx) =>
       [
@@ -302,11 +464,11 @@ async function analyzeCommitsBatch({ apiKey, model, commitsBatch }) {
         "```",
         `=== COMMIT ${idx + 1} END ===`,
         "",
-      ].join("\n")
+      ].join("\n"),
     )
     .join("\n");
 
-  const prompt = `
+  return `
 You are analyzing git commits for a performance review brag document.
 
 You receive multiple commits with:
@@ -342,7 +504,9 @@ Now process the following commits:
 
 ${blocks}
 `.trim();
+}
 
+async function callGemini({ apiKey, model, prompt }) {
   const body = {
     contents: [
       {
@@ -356,7 +520,7 @@ ${blocks}
   };
 
   const url = `${GEMINI_BASE}/${encodeURIComponent(
-    model
+    model,
   )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const res = await fetch(url, {
@@ -384,6 +548,86 @@ ${blocks}
     rawText = data;
   }
 
+  return rawText;
+}
+
+async function callOpenAI({ apiKey, model, prompt }) {
+  const body = {
+    model,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.2,
+    max_tokens: 2000,
+  };
+
+  const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenAI error ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  return data?.choices?.[0]?.message?.content ?? "";
+}
+
+async function callClaude({ apiKey, model, prompt }) {
+  const body = {
+    model,
+    max_tokens: 2000,
+    messages: [{ role: "user", content: prompt }],
+  };
+
+  const res = await fetch(`${ANTHROPIC_BASE}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Anthropic error ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  if (!Array.isArray(data.content)) return "";
+  return data.content.map((p) => p?.text ?? "").join("");
+}
+
+async function analyzeCommitsBatch({ provider, apiKey, model, commitsBatch }) {
+  if (typeof fetch !== "function") {
+    throw new Error(
+      "Global fetch is not available. Use Node 18+ or polyfill fetch.",
+    );
+  }
+
+  const prompt = buildPrompt(commitsBatch);
+  let rawText = "";
+
+  switch (provider) {
+    case "gemini":
+      rawText = await callGemini({ apiKey, model, prompt });
+      break;
+    case "gpt":
+      rawText = await callOpenAI({ apiKey, model, prompt });
+      break;
+    case "claude":
+      rawText = await callClaude({ apiKey, model, prompt });
+      break;
+    default:
+      throw new Error(`Unsupported provider: ${provider}`);
+  }
+
   const txt = (rawText || "").trim();
   const start = txt.indexOf("[");
   const end = txt.lastIndexOf("]");
@@ -393,7 +637,6 @@ ${blocks}
   try {
     arr = JSON.parse(jsonText);
   } catch {
-    // fallback: semua commit di batch ini pakai typeHint + message
     const fallback = {};
     for (const c of commitsBatch) {
       fallback[c.hash] = {
@@ -429,27 +672,36 @@ ${blocks}
   return map;
 }
 
-async function analyzeAllCommitsWithDiff({ apiKey, model, enrichedCommits }) {
+async function analyzeAllCommitsWithDiff({
+  provider,
+  apiKey,
+  model,
+  enrichedCommits,
+  colorize,
+}) {
   const batches = chunkCommits(enrichedCommits, 40000);
   const analysisMap = {};
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
     console.log(
-      `🧠 Analyzing batch ${i + 1}/${batches.length} (${
-        batch.length
-      } commits)...`
+      colorize(
+        `🧠 Analyzing batch ${i + 1}/${batches.length} (${
+          batch.length
+        } commits)...`,
+        "magenta",
+      ),
     );
     try {
       const res = await analyzeCommitsBatch({
+        provider,
         apiKey,
         model,
         commitsBatch: batch,
       });
       Object.assign(analysisMap, res);
     } catch (e) {
-      console.error(`  Gemini batch error: ${e.message}`);
-      // fallback: typeHint + message
+      console.error(colorize(`  ${provider} batch error: ${e.message}`, "red"));
       for (const c of batch) {
         if (!analysisMap[c.hash]) {
           analysisMap[c.hash] = {
@@ -507,9 +759,7 @@ async function createBragDoc({
       };
 
       const dateStr = c.date?.toISOString?.().slice(0, 10) ?? "";
-      const base = `- ${a.summary} (${shortHash(c.hash)}${
-        dateStr ? ", " + dateStr : ""
-      })`;
+      const base = `- ${a.summary} (${shortHash(c.hash)}${dateStr ? ", " + dateStr : ""})`;
 
       switch (a.type) {
         case "feature":
@@ -560,26 +810,112 @@ async function createBragDoc({
 async function main() {
   const args = parseArgs();
   const rootPath = path.resolve(args.path || ".");
-  const email = args.email || process.env.GITBRAG_EMAIL;
-  const apiKey = args.apiKey || process.env.GEMINI_API_KEY;
-  const since = args.since || process.env.GITBRAG_SINCE; // optional
-  const until = args.until || process.env.GITBRAG_UNTIL; // optional
-  const model = args.model || process.env.GITBRAG_MODEL || DEFAULT_MODEL;
+  const isInteractive = process.stdin.isTTY && process.stdout.isTTY;
+  const colorize = makeColorizer(process.stdout.isTTY);
+
+  let provider = normalizeProvider(
+    args.provider || process.env.GITBRAG_PROVIDER || "gemini",
+  );
+  let email = args.email || process.env.GITBRAG_EMAIL;
+  let since = args.since || process.env.GITBRAG_SINCE; // optional
+  let until = args.until || process.env.GITBRAG_UNTIL; // optional
+  let model = args.model || process.env.GITBRAG_MODEL;
+
+  if (isInteractive) {
+    // ---- PROVIDER ----
+    const normalized = normalizeProvider(provider) || "gemini";
+    const defaultProviderIndex = Math.max(
+      0,
+      PROVIDER_MENU.findIndex((p) => p.value === normalized),
+    );
+
+    const pickedProviderLabel = await selectFromList(
+      "Select provider",
+      PROVIDER_MENU.map((p) => p.label),
+      defaultProviderIndex,
+      colorize,
+    );
+
+    provider =
+      PROVIDER_MENU.find((p) => p.label === pickedProviderLabel)?.value ||
+      "gemini";
+
+    // ---- MODEL (PILIH DI SINI, SEBELUM readline) ----
+    if (MODEL_CHOICES[provider]?.length) {
+      const choices = MODEL_CHOICES[provider];
+      const preferred = model || DEFAULT_MODELS[provider];
+      const defaultIndex = Math.max(0, choices.indexOf(preferred));
+
+      model = await selectFromList(
+        "Select model",
+        choices,
+        defaultIndex,
+        colorize,
+      );
+    }
+
+    // ---- BARU PROMPT TEKS ----
+    email = await promptRequired("Author email", email, colorize);
+    since = await promptOptional("Since date (YYYY-MM-DD)", since, colorize);
+    until = await promptOptional("Until date (YYYY-MM-DD)", until, colorize);
+  }
+
+  if (!provider) {
+    console.error(
+      colorize("ERROR: --provider must be gemini, gpt, or claude.", "red"),
+    );
+    process.exit(1);
+  }
+
+  if (!model) {
+    model = DEFAULT_MODELS[provider];
+  }
+
+  const envKeys = {
+    gemini: process.env.GEMINI_API_KEY,
+    gpt: process.env.OPENAI_API_KEY,
+    claude: process.env.ANTHROPIC_API_KEY,
+  };
+
+  let apiKey = args.apiKey;
+  if (!apiKey) {
+    if (provider === "gemini") apiKey = args.geminiApiKey || envKeys.gemini;
+    if (provider === "gpt") apiKey = args.openaiApiKey || envKeys.gpt;
+    if (provider === "claude") apiKey = args.anthropicApiKey || envKeys.claude;
+  }
+
+  if (isInteractive) {
+    const apiLabel =
+      provider === "gemini"
+        ? "Gemini API key"
+        : provider === "gpt"
+          ? "OpenAI API key"
+          : "Anthropic API key";
+    apiKey = await promptRequired(apiLabel, apiKey, colorize);
+  }
 
   if (!email) {
-    console.error("ERROR: --email or GITBRAG_EMAIL is required.");
+    console.error(
+      colorize("ERROR: --email or GITBRAG_EMAIL is required.", "red"),
+    );
     process.exit(1);
   }
   if (!apiKey) {
-    console.error("ERROR: --gemini-api-key or GEMINI_API_KEY is required.");
+    const keyHint =
+      provider === "gemini"
+        ? "--gemini-api-key or GEMINI_API_KEY"
+        : provider === "gpt"
+          ? "--openai-api-key or OPENAI_API_KEY"
+          : "--anthropic-api-key or ANTHROPIC_API_KEY";
+    console.error(colorize(`ERROR: ${keyHint} is required.`, "red"));
     process.exit(1);
   }
 
-  console.log(`🔍 Scanning repositories under: ${rootPath}`);
+  console.log(colorize(`🔍 Scanning repositories under: ${rootPath}`, "cyan"));
   const repos = await scanRepositories(rootPath);
 
   if (!repos.length) {
-    console.error("No git repositories found.");
+    console.error(colorize("No git repositories found.", "red"));
     process.exit(1);
   }
 
@@ -595,12 +931,15 @@ async function main() {
   }
 
   if (!reposWithCommits.length) {
-    console.error("No commits found for this filter.");
+    console.error(colorize("No commits found for this filter.", "yellow"));
     process.exit(1);
   }
 
   console.log(
-    `Found ${reposWithCommits.length} repos with ${totalFound} commits for ${email}`
+    colorize(
+      `Found ${reposWithCommits.length} repos with ${totalFound} commits for ${email}`,
+      "green",
+    ),
   );
 
   const selectedRepos = await selectReposInteractive(reposWithCommits);
@@ -613,15 +952,20 @@ async function main() {
     const repoCommits = [];
     for (const c of repo.commits) {
       console.log(
-        `Collecting diff ${repo.name}@${shortHash(c.hash)} (${c.date
-          .toISOString()
-          .slice(0, 10)})...`
+        colorize(
+          `Collecting diff ${repo.name}@${shortHash(c.hash)} (${c.date
+            .toISOString()
+            .slice(0, 10)})...`,
+          "gray",
+        ),
       );
       let diff = "";
       try {
         diff = await getDiffForCommit(repo.path, c.hash);
       } catch (e) {
-        console.error(`  Failed to get diff for ${c.hash}: ${e.message}`);
+        console.error(
+          colorize(`  Failed to get diff for ${c.hash}: ${e.message}`, "red"),
+        );
         continue;
       }
 
@@ -642,20 +986,25 @@ async function main() {
   }
 
   if (!enrichedCommits.length) {
-    console.error("No diffs collected. Nothing to analyze.");
+    console.error(colorize("No diffs collected. Nothing to analyze.", "red"));
     process.exit(1);
   }
 
   console.log(
-    `\n🧠 Using model: ${model} (batched analysis, ${enrichedCommits.length} commits)...`
+    colorize(
+      `\n🧠 Using provider: ${provider} | model: ${model} (batched analysis, ${enrichedCommits.length} commits)...`,
+      "magenta",
+    ),
   );
   const analysisMap = await analyzeAllCommitsWithDiff({
+    provider,
     apiKey,
     model,
     enrichedCommits,
+    colorize,
   });
 
-  console.log("\n📝 Generating brag.md ...");
+  console.log(colorize("\n📝 Generating brag.md ...", "cyan"));
   const { filename, totalCommits } = await createBragDoc({
     selectedRepos,
     enrichedByRepo,
@@ -665,14 +1014,14 @@ async function main() {
 
   const outPath = path.resolve(filename);
   console.log(
-    `\n✅ Done. ${totalCommits} commits summarized.\n📄 Brag document: ${outPath}`
+    colorize(
+      `\n✅ Done. ${totalCommits} commits summarized.\n📄 Brag document: ${outPath}`,
+      "green",
+    ),
   );
 }
 
-const __filename = fileURLToPath(import.meta.url);
-if (process.argv[1] === __filename) {
-  main().catch((err) => {
-    console.error("Fatal error:", err);
-    process.exit(1);
-  });
-}
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
