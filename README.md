@@ -5,7 +5,7 @@ A CLI to scan git repositories, summarize contributions, and generate review-rea
 ## Usage
 
 ```bash
-node src/cli.mjs --path . --emails you@company.com --since 2025-01-01 --until 2025-12-31
+node src/mew_cli.mjs --path . --emails you@company.com --since 2025-01-01 --until 2025-12-31
 ```
 
 ## New Flags
